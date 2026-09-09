@@ -87,8 +87,12 @@ class HMCInfo(NamedTuple):
     num_integration_steps: int
 
 
-def init(position: ArrayLikeTree, logdensity_fn: Callable):
-    logdensity, logdensity_grad = jax.value_and_grad(logdensity_fn)(position)
+def init(position: ArrayLikeTree, logdensity_fn: Callable, logdensity_fn_kwargs: dict | None = None):
+    if logdensity_fn_kwargs:
+        _logdensity_fn = lambda x: logdensity_fn(x, **logdensity_fn_kwargs)
+    else:
+        _logdensity_fn = logdensity_fn
+    logdensity, logdensity_grad = jax.value_and_grad(_logdensity_fn)(position)
     return HMCState(position, logdensity, logdensity_grad)
 
 
@@ -283,11 +287,17 @@ def build_kernel(
         step_size: float,
         inverse_mass_matrix: metrics.MetricTypes,
         num_integration_steps: int,
+        logdensity_fn_kwargs: dict | None = None,
     ) -> tuple[HMCState, HMCInfo]:
         """Generate a new sample with the HMC kernel."""
 
+        if logdensity_fn_kwargs:
+            _logdensity_fn = lambda x: logdensity_fn(x, **logdensity_fn_kwargs)
+        else:
+            _logdensity_fn = logdensity_fn
+
         metric = metrics.default_metric(inverse_mass_matrix)
-        symplectic_integrator = integrator(logdensity_fn, metric.kinetic_energy)
+        symplectic_integrator = integrator(_logdensity_fn, metric.kinetic_energy)
         generate = build_proposal(
             symplectic_integrator,
             metric.kinetic_energy,

@@ -266,6 +266,7 @@ def window_adaptation(
     progress_bar: bool = False,
     adaptation_info_fn: Callable = return_all_adapt_info,
     integrator=mcmc.integrators.velocity_verlet,
+    logdensity_fn_kwargs: dict | None = None,
     **extra_parameters,
 ) -> AdaptationAlgorithm:
     """Adapt the value of the inverse mass matrix and step size parameters of
@@ -389,7 +390,7 @@ def window_adaptation(
     )
 
     def one_step(carry, xs):
-        _, rng_key, adaptation_stage = xs
+        _, rng_key, adaptation_stage, kwargs_step = xs
         state, adaptation_state = carry
 
         new_state, info = mcmc_kernel(
@@ -398,6 +399,7 @@ def window_adaptation(
             logdensity_fn,
             adaptation_state.step_size,
             adaptation_state.inverse_mass_matrix,
+            **(dict(logdensity_fn_kwargs=kwargs_step) if logdensity_fn_kwargs is not None else {}),
             **extra_parameters,
         )
         new_adaptation_state = adapt_step(
@@ -413,7 +415,7 @@ def window_adaptation(
         )
 
     def run(rng_key: PRNGKey, position: ArrayLikeTree, num_steps: int = 1000):
-        init_state = algorithm.init(position, logdensity_fn)
+        init_state = algorithm.init(position, logdensity_fn, logdensity_fn_kwargs)
         init_adaptation_state = adapt_init(position, initial_step_size)
 
         if progress_bar:
@@ -422,10 +424,21 @@ def window_adaptation(
         start_state = (init_state, init_adaptation_state)
         keys = jax.random.split(rng_key, num_steps)
         schedule = build_schedule(num_steps)
+        # Broadcast logdensity_fn_kwargs across steps so it flows as a traced
+        # JAX argument rather than a Python-level closure constant.  When no
+        # kwargs are provided we use a sentinel empty-array dict that scan can
+        # still handle as a valid (but ignored) pytree.
+        if logdensity_fn_kwargs is not None:
+            kwargs_broadcast = jax.tree.map(
+                lambda x: jnp.broadcast_to(x, (num_steps,) + jnp.shape(x)),
+                logdensity_fn_kwargs,
+            )
+        else:
+            kwargs_broadcast = {}
         last_state, info = scan_fn(
             one_step,
             start_state,
-            (jnp.arange(num_steps), keys, schedule),
+            (jnp.arange(num_steps), keys, schedule, kwargs_broadcast),
         )
 
         last_chain_state, last_warmup_state, *_ = last_state

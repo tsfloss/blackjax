@@ -117,11 +117,17 @@ def build_kernel(
         step_size: float,
         inverse_mass_matrix: metrics.MetricTypes,
         max_num_doublings: int = 10,
+        logdensity_fn_kwargs: dict | None = None,
     ) -> tuple[hmc.HMCState, NUTSInfo]:
         """Generate a new sample with the NUTS kernel."""
 
+        if logdensity_fn_kwargs:
+            _logdensity_fn = lambda x: logdensity_fn(x, **logdensity_fn_kwargs)
+        else:
+            _logdensity_fn = logdensity_fn
+
         metric = metrics.default_metric(inverse_mass_matrix)
-        symplectic_integrator = integrator(logdensity_fn, metric.kinetic_energy)
+        symplectic_integrator = integrator(_logdensity_fn, metric.kinetic_energy)
         proposal_generator = iterative_nuts_proposal(
             symplectic_integrator,
             metric.kinetic_energy,

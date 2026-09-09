@@ -30,9 +30,11 @@ We can also generate a relativistic dynamic :cite:p:`lu2017relativistic`.
 """
 from typing import Callable, NamedTuple, Protocol, TypeAlias
 
+import jax
 import jax.numpy as jnp
 import jax.scipy as jscipy
 from jax.flatten_util import ravel_pytree
+import os
 
 from blackjax.types import Array, ArrayLikeTree, ArrayTree, Numeric, PRNGKey
 from blackjax.util import generate_gaussian_noise, linear_map
@@ -216,7 +218,13 @@ def gaussian_euclidean(
         del position
         momentum, _ = ravel_pytree(momentum)
         velocity = linear_map(inverse_mass_matrix, momentum)
-        kinetic_energy_val = 0.5 * jnp.dot(velocity, momentum)
+        if os.environ.get("float") == '64':
+            print("using 64 bit precision for kinetic energy")
+            with jax.enable_x64():
+                # kinetic_energy_val = 0.5 * jnp.dot(velocity, momentum, dtype=jnp.float64)
+                kinetic_energy_val = 0.5 * jnp.sum(velocity * momentum, dtype=jnp.float64)
+        else:
+            kinetic_energy_val = 0.5 * jnp.dot(velocity, momentum)
         return kinetic_energy_val
 
     def is_turning(
