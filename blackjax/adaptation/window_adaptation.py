@@ -30,7 +30,7 @@ from blackjax.adaptation.step_size import (
 )
 from blackjax.base import AdaptationAlgorithm
 from blackjax.progress_bar import gen_scan_fn
-from blackjax.types import Array, ArrayLikeTree, PRNGKey
+from blackjax.types import Array, ArrayLikeTree, ArrayTree, PRNGKey
 from blackjax.util import pytree_size
 
 __all__ = ["WindowAdaptationState", "base", "build_schedule", "window_adaptation"]
@@ -40,14 +40,15 @@ class WindowAdaptationState(NamedTuple):
     ss_state: DualAveragingAdaptationState  # step size
     imm_state: MassMatrixAdaptationState  # inverse mass matrix
     step_size: float
-    inverse_mass_matrix: Array
+    inverse_mass_matrix: ArrayTree
 
 
 def base(
     is_mass_matrix_diagonal: bool,
     target_acceptance_rate: float = 0.80,
-    initial_inverse_mass_matrix: Array | None = None,
+    initial_inverse_mass_matrix: ArrayLikeTree | None = None,
     imm_shrinkage_to_previous: float = 0.0,
+    pytree_mass_matrix: bool = False,
 ) -> tuple[Callable, Callable, Callable]:
     """Warmup scheme for sampling procedures based on euclidean manifold HMC.
     The schedule and algorithms used match Stan's :cite:p:`stan_hmc_param` as closely as possible.
@@ -98,6 +99,9 @@ def base(
         Pseudo-count controlling shrinkage of the IMM toward the previous
         window's IMM. Default 0.0 gives the current Stan behavior. Passed
         through to ``mass_matrix_adaptation``.
+    pytree_mass_matrix
+        Store the diagonal inverse mass matrix as a PyTree with the structure of
+        the position, see ``mass_matrix_adaptation``.
 
     Returns
     -------
@@ -111,7 +115,7 @@ def base(
 
     """
     mm_init, mm_update, mm_final = mass_matrix_adaptation(
-        is_mass_matrix_diagonal, imm_shrinkage_to_previous
+        is_mass_matrix_diagonal, imm_shrinkage_to_previous, pytree_mass_matrix
     )
     da_init, da_update, da_final = dual_averaging_adaptation(target_acceptance_rate)
 
@@ -125,8 +129,10 @@ def base(
         We may reconsider this choice in the future.
 
         """
-        num_dimensions = pytree_size(position)
-        imm_state = mm_init(num_dimensions, initial_inverse_mass_matrix)
+        if pytree_mass_matrix:
+            imm_state = mm_init(position, initial_inverse_mass_matrix)
+        else:
+            imm_state = mm_init(pytree_size(position), initial_inverse_mass_matrix)
 
         ss_state = da_init(initial_step_size)
 
@@ -246,7 +252,7 @@ def base(
 
         return warmup_state
 
-    def final(warmup_state: WindowAdaptationState) -> tuple[float, Array]:
+    def final(warmup_state: WindowAdaptationState) -> tuple[float, ArrayTree]:
         """Return the final values for the step size and mass matrix."""
         step_size = jnp.exp(warmup_state.ss_state.log_step_size_avg)
         inverse_mass_matrix = warmup_state.imm_state.inverse_mass_matrix
@@ -259,8 +265,9 @@ def window_adaptation(
     algorithm,
     logdensity_fn: Callable,
     is_mass_matrix_diagonal: bool = True,
-    initial_inverse_mass_matrix: Array | None = None,
+    initial_inverse_mass_matrix: ArrayLikeTree | None = None,
     imm_shrinkage_to_previous: float = 0.0,
+    pytree_mass_matrix: bool = False,
     initial_step_size: float = 1.0,
     target_acceptance_rate: float = 0.80,
     progress_bar: bool = False,
@@ -308,6 +315,9 @@ def window_adaptation(
 
         A ``ValueError`` is raised at construction time (before any JIT
         tracing) if the shape is inconsistent.
+
+        A PyTree with the structure of the position (leaves broadcastable to the
+        position leaves, e.g. scalars) selects ``pytree_mass_matrix``.
     imm_shrinkage_to_previous
         Bayesian pseudo-count controlling shrinkage of the per-window
         adapted inverse mass matrix toward the *previous* window's IMM, in
@@ -332,6 +342,13 @@ def window_adaptation(
 
         Validated at construction time — negative values raise
         ``ValueError`` before any JIT tracing.
+    pytree_mass_matrix
+        Adapt a diagonal inverse mass matrix stored as a PyTree with the
+        structure of the position, updated leaf by leaf. Nothing is raveled, so
+        a position sharded across devices keeps its layout throughout the
+        warmup and the returned ``inverse_mass_matrix`` is sharded like the
+        position. Requires ``is_mass_matrix_diagonal``; selected automatically
+        when ``initial_inverse_mass_matrix`` is a PyTree.
     initial_step_size
         The initial step size used in the algorithm.
     target_acceptance_rate
@@ -354,7 +371,14 @@ def window_adaptation(
     """
     # Validate initial_inverse_mass_matrix shape against is_mass_matrix_diagonal.
     # Do this BEFORE any JIT-traced path so the user gets a clear Python error.
-    if initial_inverse_mass_matrix is not None:
+    if initial_inverse_mass_matrix is not None and not jax.tree_util.treedef_is_leaf(
+        jax.tree.structure(initial_inverse_mass_matrix)
+    ):
+        pytree_mass_matrix = True
+    if pytree_mass_matrix and not is_mass_matrix_diagonal:
+        raise ValueError("pytree_mass_matrix requires is_mass_matrix_diagonal=True")
+
+    if initial_inverse_mass_matrix is not None and not pytree_mass_matrix:
         imm = jnp.asarray(initial_inverse_mass_matrix)
         if is_mass_matrix_diagonal:
             if imm.ndim != 1:
@@ -387,6 +411,7 @@ def window_adaptation(
         target_acceptance_rate=target_acceptance_rate,
         initial_inverse_mass_matrix=initial_inverse_mass_matrix,
         imm_shrinkage_to_previous=imm_shrinkage_to_previous,
+        pytree_mass_matrix=pytree_mass_matrix,
     )
 
     def one_step(carry, xs):

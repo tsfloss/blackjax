@@ -23,7 +23,7 @@ from typing import Callable, NamedTuple
 import jax
 import jax.numpy as jnp
 
-from blackjax.types import Array, ArrayLike
+from blackjax.types import Array, ArrayLike, ArrayLikeTree, ArrayTree
 
 __all__ = [
     "WelfordAlgorithmState",
@@ -47,8 +47,8 @@ class WelfordAlgorithmState(NamedTuple):
 
     """
 
-    mean: Array
-    m2: Array
+    mean: ArrayTree
+    m2: ArrayTree
     sample_size: int
 
 
@@ -62,13 +62,14 @@ class MassMatrixAdaptationState(NamedTuple):
 
     """
 
-    inverse_mass_matrix: Array
+    inverse_mass_matrix: ArrayTree
     wc_state: WelfordAlgorithmState
 
 
 def mass_matrix_adaptation(
     is_diagonal_matrix: bool = True,
     imm_shrinkage_to_previous: float = 0.0,
+    pytree_mass_matrix: bool = False,
 ) -> tuple[Callable, Callable, Callable]:
     """Adapts the values in the mass matrix by computing the covariance
     between parameters.
@@ -115,6 +116,13 @@ def mass_matrix_adaptation(
         Pathfinder/multipathfinder fit on the right model). No upper bound
         is enforced — only ``k_prev >= 0.0`` is validated (raises
         ``ValueError`` on negative).
+    pytree_mass_matrix
+        Only with ``is_diagonal_matrix``. When True the diagonal inverse mass
+        matrix and the Welford statistics are stored as PyTrees with the
+        structure of the position and updated leaf by leaf, without raveling
+        the position. A position sharded across devices then stays sharded.
+        ``init`` takes the position (instead of the number of dimensions) as
+        its first argument.
 
     Returns
     -------
@@ -133,11 +141,16 @@ def mass_matrix_adaptation(
             f"got {imm_shrinkage_to_previous}"
         )
 
-    wc_init, wc_update, wc_final = welford_algorithm(is_diagonal_matrix)
+    if pytree_mass_matrix and not is_diagonal_matrix:
+        raise ValueError("pytree_mass_matrix requires is_diagonal_matrix=True")
+
+    wc_init, wc_update, wc_final = welford_algorithm(
+        is_diagonal_matrix, pytree=pytree_mass_matrix
+    )
 
     def init(
-        n_dims: int,
-        initial_inverse_mass_matrix: Array | None = None,
+        n_dims: int | ArrayLikeTree,
+        initial_inverse_mass_matrix: ArrayLikeTree | None = None,
     ) -> MassMatrixAdaptationState:
         """Initialize the matrix adaptation.
 
@@ -145,7 +158,9 @@ def mass_matrix_adaptation(
         ----------
         n_dims
             The number of dimensions of the mass matrix, which corresponds to
-            the number of dimensions of the chain position.
+            the number of dimensions of the chain position. With
+            ``pytree_mass_matrix`` the chain position itself, which sets the
+            structure, shapes and layout of the mass matrix.
         initial_inverse_mass_matrix
             Optional seed value for the inverse mass matrix.  When ``None``
             (default) the standard identity initialisation is used: ``ones(d)``
@@ -158,6 +173,20 @@ def mass_matrix_adaptation(
             responsibility (``window_adaptation`` checks before the JIT path).
 
         """
+        if pytree_mass_matrix:
+            position = n_dims
+            if initial_inverse_mass_matrix is None:
+                inverse_mass_matrix = jax.tree.map(jnp.ones_like, position)
+            else:
+                inverse_mass_matrix = jax.tree.map(
+                    lambda imm, x: jnp.broadcast_to(imm, jnp.shape(x)).astype(
+                        jnp.result_type(x)
+                    ),
+                    initial_inverse_mass_matrix,
+                    position,
+                )
+            return MassMatrixAdaptationState(inverse_mass_matrix, wc_init(position))
+
         if initial_inverse_mass_matrix is None:
             if is_diagonal_matrix:
                 inverse_mass_matrix = jnp.ones(n_dims)
@@ -184,7 +213,8 @@ def mass_matrix_adaptation(
 
         """
         inverse_mass_matrix, wc_state = mm_state
-        position, _ = jax.flatten_util.ravel_pytree(position)
+        if not pytree_mass_matrix:
+            position, _ = jax.flatten_util.ravel_pytree(position)
         wc_state = wc_update(wc_state, position)
         return MassMatrixAdaptationState(inverse_mass_matrix, wc_state)
 
@@ -214,6 +244,14 @@ def mass_matrix_adaptation(
         beta_prev = imm_shrinkage_to_previous / denom
         beta_ident = 5 / denom
 
+        if pytree_mass_matrix:
+            inverse_mass_matrix = jax.tree.map(
+                lambda cov, prev: beta_data * cov + beta_prev * prev + beta_ident * 1e-3,
+                covariance,
+                previous_imm,
+            )
+            return MassMatrixAdaptationState(inverse_mass_matrix, wc_init(mean))
+
         if is_diagonal_matrix:
             inverse_mass_matrix = (
                 beta_data * covariance + beta_prev * previous_imm + beta_ident * 1e-3
@@ -234,7 +272,9 @@ def mass_matrix_adaptation(
     return init, update, final
 
 
-def welford_algorithm(is_diagonal_matrix: bool) -> tuple[Callable, Callable, Callable]:
+def welford_algorithm(
+    is_diagonal_matrix: bool, pytree: bool = False
+) -> tuple[Callable, Callable, Callable]:
     r"""Welford's online estimator of covariance.
 
     It is possible to compute the variance of a population of values in an
@@ -252,6 +292,10 @@ def welford_algorithm(is_diagonal_matrix: bool) -> tuple[Callable, Callable, Cal
     is_diagonal_matrix
         When True the algorithm adapts and returns a diagonal mass matrix
         (default), otherwise adaps and returns a dense mass matrix.
+    pytree
+        Only with ``is_diagonal_matrix``. Estimate the variance of every element
+        of a PyTree leaf by leaf; ``init`` then takes a PyTree template instead
+        of the number of dimensions, and means and variances are PyTrees.
 
     Note
     ----
@@ -274,6 +318,9 @@ def welford_algorithm(is_diagonal_matrix: bool) -> tuple[Callable, Callable, Cal
 
         """
         sample_size = 0
+        if pytree:
+            mean = jax.tree.map(jnp.zeros_like, n_dims)
+            return WelfordAlgorithmState(mean, jax.tree.map(jnp.zeros_like, n_dims), sample_size)
         mean = jnp.zeros((n_dims,))
         if is_diagonal_matrix:
             m2 = jnp.zeros((n_dims,))
@@ -297,6 +344,12 @@ def welford_algorithm(is_diagonal_matrix: bool) -> tuple[Callable, Callable, Cal
         mean, m2, sample_size = wa_state
         sample_size = sample_size + 1
 
+        if pytree:
+            delta = jax.tree.map(lambda v, m: v - m, value, mean)
+            mean = jax.tree.map(lambda m, d: m + d / sample_size, mean, delta)
+            m2 = jax.tree.map(lambda q, v, m, d: q + d * (v - m), m2, value, mean, delta)
+            return WelfordAlgorithmState(mean, m2, sample_size)
+
         delta = value - mean
         mean = mean + delta / sample_size
         updated_delta = value - mean
@@ -311,6 +364,8 @@ def welford_algorithm(is_diagonal_matrix: bool) -> tuple[Callable, Callable, Cal
         wa_state: WelfordAlgorithmState,
     ) -> tuple[Array, int, Array]:
         mean, m2, sample_size = wa_state
+        if pytree:
+            return jax.tree.map(lambda q: q / (sample_size - 1), m2), sample_size, mean
         covariance = m2 / (sample_size - 1)
         return covariance, sample_size, mean
 

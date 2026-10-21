@@ -43,6 +43,7 @@ __all__ = [
     "LowRankInverseMassMatrix",
     "default_metric",
     "gaussian_euclidean",
+    "gaussian_euclidean_pytree",
     "gaussian_euclidean_low_rank",
     "gaussian_riemannian",
 ]
@@ -142,6 +143,9 @@ def default_metric(metric: MetricTypes) -> Metric:
       and is safe to transport across ``jax.vmap`` boundaries.
     - An ``Array`` which is assumed to specify the inverse mass matrix of a static
       metric
+    - A PyTree of arrays with the structure of the position, which is assumed to
+      specify the diagonal of a static inverse mass matrix leaf by leaf, see
+      :func:`gaussian_euclidean_pytree`
     - A function that takes a coordinate position and returns the mass matrix at that
       location
 
@@ -164,6 +168,10 @@ def default_metric(metric: MetricTypes) -> Metric:
     # at the given position and return the corresponding Riemannian metric.
     if callable(metric):
         return gaussian_riemannian(metric)
+
+    # A PyTree of arrays specifies a diagonal inverse mass matrix leaf by leaf.
+    if not jax.tree_util.treedef_is_leaf(jax.tree.structure(metric)):
+        return gaussian_euclidean_pytree(metric)
 
     # If we make it here then the argument should be an array, and we'll assume
     # that it specifies a static inverse mass matrix.
@@ -300,6 +308,103 @@ def gaussian_euclidean(
         scaled = linear_map(left_hand_side_matrix, ravelled_element)
 
         return unravel_fn(scaled)
+
+    return Metric(momentum_generator, kinetic_energy, is_turning, scale)
+
+
+def gaussian_euclidean_pytree(
+    inverse_mass_matrix: ArrayLikeTree,
+) -> Metric:
+    r"""Gaussian euclidean metric with a diagonal inverse mass matrix stored as a PyTree.
+
+    Mathematically identical to :func:`gaussian_euclidean` with a diagonal
+    inverse mass matrix, but every operation acts leaf by leaf instead of on the
+    raveled position. Nothing is concatenated, so each leaf of the momentum and
+    of the mass matrix keeps the layout of the corresponding position leaf; a
+    position sharded across devices is never gathered.
+
+    Parameters
+    ----------
+    inverse_mass_matrix
+        PyTree with the structure of the position whose leaves hold the diagonal
+        of the inverse mass matrix, each broadcastable to the shape of the
+        corresponding position leaf (e.g. a scalar per leaf).
+
+    Returns
+    -------
+    A ``Metric`` object with ``sample_momentum``, ``kinetic_energy``,
+    ``check_turning``, and ``scale`` fields.
+
+    """
+    mass_matrix_sqrt = jax.tree.map(lambda imm: 1.0 / jnp.sqrt(imm), inverse_mass_matrix)
+    inv_mass_matrix_sqrt = jax.tree.map(jnp.sqrt, inverse_mass_matrix)
+
+    def _tree_dot(a: ArrayLikeTree, b: ArrayLikeTree) -> Numeric:
+        if os.environ.get("float") == '64':
+            with jax.enable_x64():
+                leaves = jax.tree.leaves(jax.tree.map(
+                    lambda x, y: jnp.sum(x * y, dtype=jnp.float64), a, b))
+                return sum(leaves)
+        return sum(jax.tree.leaves(jax.tree.map(lambda x, y: jnp.sum(x * y), a, b)))
+
+    def momentum_generator(rng_key: PRNGKey, position: ArrayLikeTree) -> ArrayTree:
+        leaves, treedef = jax.tree.flatten(position)
+        keys = jax.random.split(rng_key, len(leaves))
+        noise = [
+            jax.random.normal(key, jnp.shape(leaf), jnp.result_type(leaf))
+            for key, leaf in zip(keys, leaves)
+        ]
+        return jax.tree.map(
+            lambda eps, sigma: eps * sigma,
+            jax.tree.unflatten(treedef, noise),
+            mass_matrix_sqrt,
+        )
+
+    def kinetic_energy(
+        momentum: ArrayLikeTree, position: ArrayLikeTree | None = None
+    ) -> Numeric:
+        del position
+        velocity = jax.tree.map(lambda imm, p: imm * p, inverse_mass_matrix, momentum)
+        return 0.5 * _tree_dot(velocity, momentum)
+
+    def is_turning(
+        momentum_left: ArrayLikeTree,
+        momentum_right: ArrayLikeTree,
+        momentum_sum: ArrayLikeTree,
+        position_left: ArrayLikeTree | None = None,
+        position_right: ArrayLikeTree | None = None,
+    ) -> bool:
+        """Generalized U-turn criterion, see :func:`gaussian_euclidean`.
+
+        NUTS's iterative termination check stores raveled momenta; those are
+        handled with the raveled inverse mass matrix (and are not sharded).
+        """
+        del position_left, position_right
+
+        imm = inverse_mass_matrix
+        if jax.tree_util.treedef_is_leaf(jax.tree.structure(momentum_left)):
+            imm = ravel_pytree(imm)[0]
+        velocity_left = jax.tree.map(lambda i, p: i * p, imm, momentum_left)
+        velocity_right = jax.tree.map(lambda i, p: i * p, imm, momentum_right)
+        rho = jax.tree.map(
+            lambda s, r, l: s - (r + l) / 2, momentum_sum, momentum_right, momentum_left
+        )
+        turning_at_left = _tree_dot(velocity_left, rho) <= 0
+        turning_at_right = _tree_dot(velocity_right, rho) <= 0
+        return turning_at_left | turning_at_right
+
+    def scale(
+        position: ArrayLikeTree,
+        element: ArrayLikeTree,
+        *,
+        inv: bool,
+        trans: bool,
+    ) -> ArrayLikeTree:
+        """Scale elements by the (inverse) square root mass matrix, see
+        :func:`gaussian_euclidean`. Transposition is a no-op for a diagonal matrix."""
+        del position, trans
+        factor = inv_mass_matrix_sqrt if inv else mass_matrix_sqrt
+        return jax.tree.map(lambda f, e: f * e, factor, element)
 
     return Metric(momentum_generator, kinetic_energy, is_turning, scale)
 
