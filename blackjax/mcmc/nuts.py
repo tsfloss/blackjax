@@ -277,9 +277,9 @@ def iterative_nuts_proposal(
         max_num_expansions,
     )
 
-    def _compute_energy(state: integrators.IntegratorState) -> float:
-        energy = -state.logdensity + kinetic_energy(state.momentum)
-        return energy
+    # Same energy function as used inside the trajectory builders, so that H0
+    # and every H_i are computed identically (incl. the float64 path).
+    _compute_energy = trajectory.hmc_energy(kinetic_energy)
 
     def propose(rng_key, initial_state: integrators.IntegratorState, step_size):
         initial_termination_state = new_termination_state(

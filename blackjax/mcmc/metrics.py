@@ -34,8 +34,8 @@ import jax
 import jax.numpy as jnp
 import jax.scipy as jscipy
 from jax.flatten_util import ravel_pytree
-import os
 
+from blackjax.mcmc._precision import use_x64
 from blackjax.types import Array, ArrayLikeTree, ArrayTree, Numeric, PRNGKey
 from blackjax.util import generate_gaussian_noise, linear_map
 
@@ -226,7 +226,7 @@ def gaussian_euclidean(
         del position
         momentum, _ = ravel_pytree(momentum)
         velocity = linear_map(inverse_mass_matrix, momentum)
-        if os.environ.get("float") == '64':
+        if use_x64():
             print("using 64 bit precision for kinetic energy")
             with jax.enable_x64():
                 # kinetic_energy_val = 0.5 * jnp.dot(velocity, momentum, dtype=jnp.float64)
@@ -340,7 +340,7 @@ def gaussian_euclidean_pytree(
     inv_mass_matrix_sqrt = jax.tree.map(jnp.sqrt, inverse_mass_matrix)
 
     def _tree_dot(a: ArrayLikeTree, b: ArrayLikeTree) -> Numeric:
-        if os.environ.get("float") == '64':
+        if use_x64():
             with jax.enable_x64():
                 leaves = jax.tree.leaves(jax.tree.map(
                     lambda x, y: jnp.sum(x * y, dtype=jnp.float64), a, b))
@@ -365,6 +365,10 @@ def gaussian_euclidean_pytree(
     ) -> Numeric:
         del position
         velocity = jax.tree.map(lambda imm, p: imm * p, inverse_mass_matrix, momentum)
+        if use_x64():
+            # The 0.5 * must also happen in x64 mode, or it downcasts to f32.
+            with jax.enable_x64():
+                return 0.5 * _tree_dot(velocity, momentum)
         return 0.5 * _tree_dot(velocity, momentum)
 
     def is_turning(
@@ -469,6 +473,13 @@ def gaussian_euclidean_low_rank(
         # K(p) = ½ p^T M^{-1} p = ½ q^T (I + U(Λ-I)U^T) q,  q = σ⊙p
         q = sigma * p  # (d,)
         alpha = U.T @ q  # (k,)
+        if use_x64():
+            with jax.enable_x64():
+                f64 = jnp.float64
+                return 0.5 * (
+                    jnp.sum(q * q, dtype=f64)
+                    + jnp.sum(alpha * (lam - 1.0) * alpha, dtype=f64)
+                )
         return 0.5 * (jnp.dot(q, q) + jnp.dot(alpha, (lam - 1.0) * alpha))
 
     def is_turning(

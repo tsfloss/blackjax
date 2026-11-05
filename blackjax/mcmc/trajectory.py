@@ -42,6 +42,7 @@ from typing import Callable, NamedTuple
 import jax
 import jax.numpy as jnp
 
+from blackjax.mcmc._precision import as_f64, use_x64
 from blackjax.mcmc.integrators import IntegratorState
 from blackjax.mcmc.proposal import (
     Proposal,
@@ -743,6 +744,11 @@ def hmc_energy(kinetic_energy):
     """
 
     def energy(state):
+        if use_x64():
+            # Keep H in float64: outside the context, `+` would downcast it.
+            with jax.enable_x64():
+                kin = kinetic_energy(state.momentum, position=state.position)
+                return -as_f64(state.logdensity) + as_f64(kin)
         return -state.logdensity + kinetic_energy(
             state.momentum, position=state.position
         )

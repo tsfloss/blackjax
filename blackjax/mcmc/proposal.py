@@ -16,6 +16,7 @@ from typing import Callable, NamedTuple
 import jax
 import jax.numpy as jnp
 
+from blackjax.mcmc._precision import as_f64, use_x64
 from blackjax.types import Array, PRNGKey
 
 TrajectoryState = NamedTuple
@@ -43,6 +44,13 @@ class Proposal(NamedTuple):
 
 
 def safe_energy_diff(initial_energy: float, new_energy: float) -> float:
+    if use_x64():
+        # Subtract in float64 (both energies must already be float64 to gain
+        # anything), then cast the O(1) difference back to float32.
+        with jax.enable_x64():
+            delta_energy = as_f64(initial_energy) - as_f64(new_energy)
+            delta_energy = jnp.where(jnp.isnan(delta_energy), -jnp.inf, delta_energy)
+            return delta_energy.astype(jnp.float32)
     delta_energy = initial_energy - new_energy
     delta_energy = jnp.where(jnp.isnan(delta_energy), -jnp.inf, delta_energy)
     return delta_energy
