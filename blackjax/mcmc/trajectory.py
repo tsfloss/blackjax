@@ -46,6 +46,7 @@ from blackjax.mcmc._precision import as_f64, use_x64
 from blackjax.mcmc.integrators import IntegratorState
 from blackjax.mcmc.proposal import (
     Proposal,
+    initial_proposal,
     progressive_biased_sampling,
     progressive_uniform_sampling,
     proposal_generator,
@@ -210,7 +211,7 @@ def static_progressive_integration(
         step_size,
     ):
         initial_energy = hmc_energy_fn(initial_state)
-        init_proposal = Proposal(initial_state, initial_energy, 0.0, -jnp.inf)
+        init_proposal = initial_proposal(initial_state, initial_energy)
 
         def one_step(i, carry):
             current_state, current_proposal, any_divergent = carry

@@ -93,9 +93,11 @@ def dual_averaging(
         """
         mu: float = jnp.log(10 * x_init)
         step = 1
-        avg_error: float = 0.0
         log_x: float = jnp.log(x_init)
-        log_x_avg: float = 0.0
+        # zeros in the dtype of x_init: bare 0.0 literals are weakly typed float64 under
+        # jax_enable_x64, which lax.cond rejects against float32 updates under vmap
+        avg_error: float = jnp.zeros_like(log_x)
+        log_x_avg: float = jnp.zeros_like(log_x)
         return DualAveragingState(log_x, log_x_avg, step, avg_error, mu)
 
     def update(da_state: DualAveragingState, gradient) -> DualAveragingState:

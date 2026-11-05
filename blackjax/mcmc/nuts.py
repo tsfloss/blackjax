@@ -286,9 +286,7 @@ def iterative_nuts_proposal(
             initial_state, max_num_expansions
         )
         initial_energy = _compute_energy(initial_state)  # H0 of the HMC step
-        initial_proposal = proposal.Proposal(
-            initial_state, initial_energy, 0.0, -np.inf
-        )
+        initial_proposal = proposal.initial_proposal(initial_state, initial_energy)
         initial_trajectory = trajectory.Trajectory(
             initial_state,
             initial_state,

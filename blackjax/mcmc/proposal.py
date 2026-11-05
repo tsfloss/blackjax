@@ -56,6 +56,15 @@ def safe_energy_diff(initial_energy: float, new_energy: float) -> float:
     return delta_energy
 
 
+def initial_proposal(state, energy) -> Proposal:
+    """Proposal of a trajectory's initial state: weight 0, sum_log_p_accept -inf, in the
+    dtype that `safe_energy_diff` gives later weights. A bare Python 0.0 would be a weakly
+    typed float64 under jax_enable_x64, which `lax.cond` rejects against float32 weights
+    once the sampler is vmapped (e.g. several chains)."""
+    zero = jnp.zeros_like(safe_energy_diff(energy, energy))
+    return Proposal(state, energy, zero, zero - jnp.inf)
+
+
 def proposal_generator(energy_fn: Callable) -> tuple[Callable, Callable]:
     """
 
@@ -71,7 +80,7 @@ def proposal_generator(energy_fn: Callable) -> tuple[Callable, Callable]:
     """
 
     def new(state: TrajectoryState) -> Proposal:
-        return Proposal(state, energy_fn(state), 0.0, -jnp.inf)
+        return initial_proposal(state, energy_fn(state))
 
     def update(initial_energy: float, new_state: TrajectoryState) -> Proposal:
         """Generate a new proposal from a trajectory state.
